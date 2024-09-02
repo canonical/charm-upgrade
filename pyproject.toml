@@ -6,8 +6,7 @@ authors = ["Carl Csaposs <carl.csaposs@canonical.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
-
+python = "^3.8"
 
 [build-system]
 requires = ["poetry-core"]
