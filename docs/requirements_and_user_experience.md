@@ -276,27 +276,35 @@ where `postgresql-k8s` is replaced with the Juju application name
 ## Status messages while refresh in progress
 After the user runs `juju refresh`, these status messages will be displayed until the refresh is complete.
 
-On machines, if the charm code is refreshed and the workload version is identical (i.e. same snap revision) the refresh will immediately complete. The leader unit will log an INFO level message to `juju debug-log`. For example:
-```
-unit-postgresql-0: 11:34:35 INFO unit.postgresql/0.juju-log Charm refreshed. PostgreSQL version unchanged
-```
-where `PostgreSQL` is replaced with the name of the workload(s)
-
 > [!NOTE]
 > Status messages over 120 characters are truncated in `juju status` (tested on Juju 3.1.6 and 2.9.45)
 
 ### App status
 All of these app statuses will have higher priority than any other app status in a charm—except for [App status if `pause_after_unit_refresh` set to invalid value](#app-status-if-pause_after_unit_refresh-set-to-invalid-value).
+
+#### (Machines only) If it is not possible to determine if a refresh is in progress
+On machines, in certain cases, it is not possible to determine if a refresh is in progress.
+
+For example, it is not (easily) possible to immediately differentiate between the following cases:
+- After `juju refresh`, if the charm code is refreshed and the workload version is identical (i.e. same snap revision). (A refresh is not in progress)
+- User refreshes from charm revision 10007 to 10008. Highest unit's charm code refreshes snap from revision 20001 to 20002 and raises an uncaught exception in the same Juju event. User refreshes (rollback) to charm revision 10007. (A refresh is in progress)
+
+In both of these examples, after a few Juju events (usually a few seconds), it will be possible to determine if a refresh is in progress—as long as no units' charm code is raising an uncaught exception.
+```
+$ juju status
+[...]
+App             Version  Status       [...]    Rev  [...]  Message
+postgresql-k8s  14.12    maintenance         10008         Determining if a refresh is in progress
+[...]
+```
+
 #### If refresh will pause for manual confirmation
 (`pause_after_unit_refresh` is set to `all` or set to `first` and second unit has not started to refresh)
 
 ##### Kubernetes
 ```
-$ juju status
-[...]
-App             Version  Status   [...]    Rev  [...]  Message
-postgresql-k8s  14.12    blocked         10008         Refreshing. Check units >=11 are healthy & run `resume-refresh` on leader. To rollback, see docs or `juju debug-log`
-[...]
+App             Version  Status     Rev  Message
+postgresql-k8s  14.12    blocked  10008  Refreshing. Check units >=11 are healthy & run `resume-refresh` on leader. To rollback, see docs or `juju debug-log`
 ```
 where `>=11` is replaced with the units that have refreshed or are currently refreshing
 <!-- TODO: version field? -->
