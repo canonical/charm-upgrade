@@ -1,1 +1,1 @@
-from ._main import CharmSpecific, CharmVersion, Cloud, PrecheckFailed
+from ._main import CharmSpecific, CharmVersion, Cloud, PrecheckFailed, Refresh
