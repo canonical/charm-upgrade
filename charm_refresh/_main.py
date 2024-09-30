@@ -3,6 +3,7 @@ import dataclasses
 import enum
 import functools
 import logging
+import pathlib
 import typing
 
 import charm
@@ -579,6 +580,53 @@ class Refresh:
 
     def __init__(self, charm_specific: CharmSpecific, /):
         self.charm_specific = charm_specific
+        if self.charm_specific.cloud is Cloud.KUBERNETES:
+            # Save state if unit is tearing down.
+            # Used in future Juju event (stop event) to determine whether to set Kubernetes
+            # partition
+            tearing_down = pathlib.Path(".charm_refresh_v3/unit_tearing_down")
+            if (
+                isinstance(charm.event, charm.RelationDepartedEvent)
+                and charm.event.departing_unit == charm.unit
+            ):
+                # Unit is tearing down and 1+ other units are not tearing down
+                tearing_down.parent.mkdir(exist_ok=True)
+                tearing_down.touch(exist_ok=True)
+
+            # TODO check deployed with trust
+            client = lightkube.Client()
+        if (
+            self.charm_specific.cloud is Cloud.KUBERNETES
+            and isinstance(charm.event, charm.StopEvent)
+            # If `tearing_down.exists()`, this unit is being removed for scale down.
+            # Therefore, we should not raise the partition—so that the partition never exceeds
+            # the highest unit number (which would cause `juju refresh` to not trigger any Juju
+            # events).
+            and not tearing_down.exists()
+        ):
+            # This unit could be refreshing or just restarting.
+            # Raise StatefulSet partition to prevent other units from refreshing in case a refresh
+            # is in progress.
+            # If a refresh is not in progress, the leader unit will reset the partition to 0.
+            stateful_set = client.get(
+                lightkube.resources.apps_v1.StatefulSet, charm.app
+            )
+            partition = stateful_set.spec.updateStrategy.rollingUpdate.partition
+            assert partition is not None
+            if partition < charm.unit.number:
+                # Raise partition
+                client.patch(
+                    lightkube.resources.apps_v1.StatefulSet,
+                    charm.app,
+                    {
+                        "spec": {
+                            "updateStrategy": {
+                                "rollingUpdate": {"partition": charm.unit.number}
+                            }
+                        }
+                    },
+                )
+                logger.info(f"Set StatefulSet partition to {charm.unit.number} during stop event")
         relation = charm.Endpoint("refresh-v-three").relation
         if not relation:
             raise PeerRelationMissing
@@ -586,12 +634,9 @@ class Refresh:
         relation.my_unit["pause_after_unit_refresh_config"] = charm.config[
             "pause_after_unit_refresh"
         ]
-        # TODO set partition on stop
         # TODO update snap revision in databag
         # Check if refresh in progress
         if self.charm_specific.cloud is Cloud.KUBERNETES:
-            # TODO check deployed with trust
-            client = lightkube.Client()
             stateful_set = client.get(
                 lightkube.resources.apps_v1.StatefulSet, charm.app
             )
@@ -618,10 +663,6 @@ class Refresh:
             self._in_progress = any(
                 revision != app_controller_revision
                 for revision in unit_controller_revisions.values()
-            )
-            # TODO remove
-            logger.warning(
-                f"{self._in_progress=} {unit_controller_revisions=} {app_controller_revision=}"
             )
         else:
             pass
