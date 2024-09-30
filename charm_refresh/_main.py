@@ -462,7 +462,7 @@ class Refresh:
         """
 
     @next_unit_allowed_to_refresh.setter
-    def next_unit_allowed_to_refresh(self, value: bool):
+    def next_unit_allowed_to_refresh(self, value: typing.Literal[True]):
         if value is not True:
             raise ValueError("`next_unit_allowed_to_refresh` can only be set to `True`")
 
