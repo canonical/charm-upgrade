@@ -2,10 +2,17 @@ import abc
 import dataclasses
 import enum
 import functools
+import logging
 import typing
 
+import charm
+import lightkube
+import lightkube.resources.apps_v1
+import lightkube.resources.core_v1
 import ops
 import packaging.version
+
+logger = logging.getLogger(__name__)
 
 
 class Cloud(enum.Enum):
@@ -416,6 +423,10 @@ class CharmSpecific(abc.ABC):
             return False
 
 
+class PeerRelationMissing(Exception):
+    """Refresh peer relation is not yet available"""
+
+
 class Refresh:
     # TODO: add note about putting at end of charm __init__
 
@@ -568,3 +579,49 @@ class Refresh:
 
     def __init__(self, charm_specific: CharmSpecific, /):
         self.charm_specific = charm_specific
+        relation = charm.Endpoint("refresh-v-three").relation
+        if not relation:
+            raise PeerRelationMissing
+        # TODO comment
+        relation.my_unit["pause_after_unit_refresh_config"] = charm.config[
+            "pause_after_unit_refresh"
+        ]
+        # TODO set partition on stop
+        # TODO update snap revision in databag
+        # Check if refresh in progress
+        if self.charm_specific.cloud is Cloud.KUBERNETES:
+            # TODO check deployed with trust
+            client = lightkube.Client()
+            stateful_set = client.get(
+                lightkube.resources.apps_v1.StatefulSet, charm.app
+            )
+            app_controller_revision = stateful_set.status.updateRevision
+            assert app_controller_revision is not None
+            pods = client.list(
+                lightkube.resources.core_v1.Pod,
+                labels={"app.kubernetes.io/name": charm.app},
+            )
+
+            def get_unit(pod_name: str):
+                # Example `pod_name`: "postgresql-k8s-0"
+                *app_name, unit_number = pod_name.split("-")
+                # Example: "postgresql-k8s/0"
+                unit_name = f'{"-".join(app_name)}/{unit_number}'
+                return charm.Unit(unit_name)
+
+            unit_controller_revisions = {
+                get_unit(pod.metadata.name): pod.metadata.labels[
+                    "controller-revision-hash"
+                ]
+                for pod in pods
+            }
+            self._in_progress = any(
+                revision != app_controller_revision
+                for revision in unit_controller_revisions.values()
+            )
+            # TODO remove
+            logger.warning(
+                f"{self._in_progress=} {unit_controller_revisions=} {app_controller_revision=}"
+            )
+        else:
+            pass
