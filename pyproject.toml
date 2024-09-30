@@ -6,7 +6,7 @@ authors = ["Carl Csaposs <carl.csaposs@canonical.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.8"
+python = ">=3.8"
 packaging = ">=24.1"
 ops = ">=2.9.0"
 
