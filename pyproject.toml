@@ -11,6 +11,8 @@ packaging = ">=24.1"
 charm-api = {git = "https://github.com/canonical/charm-api"}
 ops = ">=2.9.0"
 lightkube = ">=0.15.4"
+tomli = ">=2.0.1"
+httpx = ">=0.27.2"
 
 [build-system]
 requires = ["poetry-core"]

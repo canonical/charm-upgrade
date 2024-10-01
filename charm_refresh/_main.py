@@ -2,16 +2,20 @@ import abc
 import dataclasses
 import enum
 import functools
+import json
 import logging
 import pathlib
+import platform
 import typing
 
 import charm
+import httpx
 import lightkube
 import lightkube.resources.apps_v1
 import lightkube.resources.core_v1
 import ops
 import packaging.version
+import tomli
 
 logger = logging.getLogger(__name__)
 
@@ -428,12 +432,66 @@ class PeerRelationMissing(Exception):
     """Refresh peer relation is not yet available"""
 
 
+@dataclasses.dataclass(frozen=True)
+class _HistoryEntry:
+    charm_revision: str
+    """Contents of .juju-charm file (e.g. "ch:amd64/jammy/postgresql-k8s-381")"""
+
+    time_of_refresh: float
+    """Modified time of .juju-charm file after last refresh (e.g. 1727768259.4063382)"""
+
+
+@dataclasses.dataclass
+class _MachineRefreshHistory:
+    # TODO comment?
+    last_refresh: typing.Optional[_HistoryEntry]
+    last_refresh_to_up_to_date_charm_revision: typing.Optional[_HistoryEntry]
+    second_to_last_refresh_to_up_to_date_charm_revision: typing.Optional[_HistoryEntry]
+
+    _PATH = pathlib.Path(".charm_refresh_v3/machines_refresh_history.json")
+
+    @classmethod
+    def from_file(cls):
+        try:
+            data: typing.Dict[str, typing.Optional[dict]] = json.loads(
+                cls._PATH.read_text()
+            )
+        except FileNotFoundError:
+            return cls(
+                last_refresh=None,
+                last_refresh_to_up_to_date_charm_revision=None,
+                second_to_last_refresh_to_up_to_date_charm_revision=None,
+            )
+        data2 = {}
+        for key, value in data.items():
+            if value is not None:
+                value = _HistoryEntry(**value)
+            data2[key] = value
+        return cls(**data2)
+
+    def save_to_file(self):
+        self._PATH.parent.mkdir(exist_ok=True)
+        self._PATH.write_text(json.dumps(dataclasses.asdict(self), indent=4))
+
+
+class _InProgress(enum.Enum):
+    FALSE = 0
+    TRUE = 1
+    UNKNOWN = 2
+
+
 class Refresh:
     # TODO: add note about putting at end of charm __init__
 
     @property
     def in_progress(self) -> bool:
         """Whether a refresh is currently in progress"""
+        if (
+            self._in_progress is _InProgress.TRUE
+            or self._in_progress is _InProgress.UNKNOWN
+        ):
+            return True
+        return False
 
     @property
     def next_unit_allowed_to_refresh(self) -> bool:
@@ -472,11 +530,33 @@ class Refresh:
         The user can override failing automatic health checks by running the `resume-refresh`
         action with `check-health-of-refreshed-units=false`.
         """
+        if self.charm_specific.cloud is Cloud.KUBERNETES:
+            pass  # TODO
+        elif self.charm_specific.cloud is Cloud.MACHINES:
+            value = self._relation.my_unit.get(
+                "next_unit_allowed_to_refresh_if_this_units_snap_revision_and_charm_revision_and_databag_are_up_to_date"
+            )
+            if value is None:
+                return False
+            return json.loads(value)
 
     @next_unit_allowed_to_refresh.setter
     def next_unit_allowed_to_refresh(self, value: typing.Literal[True]):
         if value is not True:
             raise ValueError("`next_unit_allowed_to_refresh` can only be set to `True`")
+        if self.charm_specific.cloud is Cloud.KUBERNETES:
+            pass  # TODO
+        elif self.charm_specific.cloud is Cloud.MACHINES:
+            if (
+                self._relation.my_unit.get("snap_revision")
+                != self._get_installed_snap_revision()
+            ):
+                raise Exception(
+                    "Must call `update_snap_revision()` before setting `next_unit_allowed_to_refresh = True`"
+                )
+            self._relation.my_unit[
+                "next_unit_allowed_to_refresh_if_this_units_snap_revision_and_charm_revision_and_databag_are_up_to_date"
+            ] = json.dumps(True)
 
     def update_snap_revision(self):
         """Must be called immediately after the workload snap is refreshed
@@ -487,12 +567,19 @@ class Refresh:
         called, this method does not need to be called again. (That situation will be automatically
         handled.)
 
-        When the snap is refreshed, `next_unit_allowed_to_refresh` is automatically reset to
-        `False`.
+        Resets `next_unit_allowed_to_refresh` to `False`.
         """
         if self.charm_specific.cloud is not Cloud.MACHINES:
             raise ValueError(
                 "`update_snap_revision` can only be called if cloud is `Cloud.MACHINES`"
+            )
+        revision = self._get_installed_snap_revision()
+        if revision != self._relation.my_unit.get("snap_revision"):
+            self._relation.my_unit[
+                "next_unit_allowed_to_refresh_if_this_units_snap_revision_and_charm_revision_and_databag_are_up_to_date"
+            ] = json.dumps(False)
+            self._relation.my_unit["snap_revision"] = (
+                self._get_installed_snap_revision()
             )
 
     @property
@@ -510,6 +597,7 @@ class Refresh:
                 "`pinned_snap_revision` can only be accessed if cloud is `Cloud.MACHINES`"
             )
         # TODO: raise exception if accessed while self.in_progress—but scale up case
+        return self._pinned_snap_revision
 
     @property
     def workload_allowed_to_start(self) -> bool:
@@ -578,71 +666,32 @@ class Refresh:
         no other unit status with a message to display.
         """
 
-    def __init__(self, charm_specific: CharmSpecific, /):
-        self.charm_specific = charm_specific
-        if self.charm_specific.cloud is Cloud.KUBERNETES:
-            # Save state if unit is tearing down.
-            # Used in future Juju event (stop event) to determine whether to set Kubernetes
-            # partition
-            tearing_down = pathlib.Path(".charm_refresh_v3/unit_tearing_down")
-            if (
-                isinstance(charm.event, charm.RelationDepartedEvent)
-                and charm.event.departing_unit == charm.unit
-            ):
-                # Unit is tearing down and 1+ other units are not tearing down
-                tearing_down.parent.mkdir(exist_ok=True)
-                tearing_down.touch(exist_ok=True)
+    def _get_installed_snap_revision(self):
+        # TODO: error handling if refresh_versions.toml incorrectly formatted
+        snap_name = self._refresh_versions["snap"]["name"]
+        # https://snapcraft.io/docs/using-the-api
+        client = httpx.Client(transport=httpx.HTTPTransport(uds="/run/snapd.socket"))
+        # https://snapcraft.io/docs/snapd-rest-api#heading--snaps
+        response = client.get(
+            "http://localhost/v2/snaps", params={"snaps": snap_name}
+        ).raise_for_status()
+        data = response.json()
+        assert data["type"] == "sync"
+        snaps = data["result"]
+        assert len(snaps) == 1
+        revision = snaps[0]["revision"]
+        assert isinstance(revision, str)
+        return revision
 
-            # TODO check deployed with trust
-            client = lightkube.Client()
-        if (
-            self.charm_specific.cloud is Cloud.KUBERNETES
-            and isinstance(charm.event, charm.StopEvent)
-            # If `tearing_down.exists()`, this unit is being removed for scale down.
-            # Therefore, we should not raise the partition—so that the partition never exceeds
-            # the highest unit number (which would cause `juju refresh` to not trigger any Juju
-            # events).
-            and not tearing_down.exists()
-        ):
-            # This unit could be refreshing or just restarting.
-            # Raise StatefulSet partition to prevent other units from refreshing in case a refresh
-            # is in progress.
-            # If a refresh is not in progress, the leader unit will reset the partition to 0.
-            stateful_set = client.get(
-                lightkube.resources.apps_v1.StatefulSet, charm.app
-            )
-            partition = stateful_set.spec.updateStrategy.rollingUpdate.partition
-            assert partition is not None
-            if partition < charm.unit.number:
-                # Raise partition
-                client.patch(
-                    lightkube.resources.apps_v1.StatefulSet,
-                    charm.app,
-                    {
-                        "spec": {
-                            "updateStrategy": {
-                                "rollingUpdate": {"partition": charm.unit.number}
-                            }
-                        }
-                    },
-                )
-                logger.info(f"Set StatefulSet partition to {charm.unit.number} during stop event")
-        relation = charm.Endpoint("refresh-v-three").relation
-        if not relation:
-            raise PeerRelationMissing
-        # TODO comment
-        relation.my_unit["pause_after_unit_refresh_config"] = charm.config[
-            "pause_after_unit_refresh"
-        ]
-        # TODO update snap revision in databag
-        # Check if refresh in progress
+    def _is_in_progress(self) -> _InProgress:
+        """Check if refresh in progress"""
         if self.charm_specific.cloud is Cloud.KUBERNETES:
-            stateful_set = client.get(
+            stateful_set = lightkube.Client().get(
                 lightkube.resources.apps_v1.StatefulSet, charm.app
             )
             app_controller_revision = stateful_set.status.updateRevision
             assert app_controller_revision is not None
-            pods = client.list(
+            pods = lightkube.Client().list(
                 lightkube.resources.core_v1.Pod,
                 labels={"app.kubernetes.io/name": charm.app},
             )
@@ -660,9 +709,153 @@ class Refresh:
                 ]
                 for pod in pods
             }
-            self._in_progress = any(
-                revision != app_controller_revision
-                for revision in unit_controller_revisions.values()
-            )
+            for revision in unit_controller_revisions.values():
+                if revision != app_controller_revision:
+                    return _InProgress.TRUE
+            return _InProgress.FALSE
+        elif self.charm_specific.cloud is Cloud.MACHINES:
+            # TODO: error handling if refresh_versions.toml incorrectly formatted
+            # TODO: error handling if arch keyerror
+            self._pinned_snap_revision = self._refresh_versions["snap"]["revisions"][
+                platform.machine()
+            ]
+            if self._get_installed_snap_revision() != self._pinned_snap_revision:
+                return _InProgress.TRUE
+            units_with_up_to_date_snap_revision = []
+            for databag in self._relation.other_units.values():
+                if databag.get("snap_revision") is None:
+                    # TODO comment scale up/initial install case
+                    continue
+                if databag["snap_revision"] != self._pinned_snap_revision:
+                    return _InProgress.TRUE
+                units_with_up_to_date_snap_revision.append(databag)
+            for databag in units_with_up_to_date_snap_revision:
+                other_unit = databag.get("last_refresh_to_up_to_date_charm_revision")
+                if other_unit is None:
+                    continue
+                other_unit = _HistoryEntry(**json.loads(other_unit))
+                if other_unit.charm_revision != self._installed_charm_revision_raw:
+                    # TODO comment
+                    return _InProgress.UNKNOWN
+                if (
+                    self._history.second_to_last_refresh_to_up_to_date_charm_revision
+                    and other_unit.time_of_refresh
+                    < self._history.second_to_last_refresh_to_up_to_date_charm_revision.time_of_refresh
+                ):
+                    # TODO comment
+                    # other unit databag is outdated
+                    return _InProgress.UNKNOWN
+            return _InProgress.FALSE
         else:
-            pass
+            raise TypeError(f"{self.charm_specific.cloud=}")
+
+    def __init__(self, charm_specific: CharmSpecific, /):
+        self.charm_specific = charm_specific
+        if self.charm_specific.cloud is Cloud.KUBERNETES:
+            # Save state if unit is tearing down.
+            # Used in future Juju event (stop event) to determine whether to set Kubernetes
+            # partition
+            tearing_down = pathlib.Path(
+                ".charm_refresh_v3/kubernetes_unit_tearing_down"
+            )
+            if (
+                isinstance(charm.event, charm.RelationDepartedEvent)
+                and charm.event.departing_unit == charm.unit
+            ):
+                # Unit is tearing down and 1+ other units are not tearing down
+                tearing_down.parent.mkdir(exist_ok=True)
+                tearing_down.touch(exist_ok=True)
+        if (
+            self.charm_specific.cloud is Cloud.KUBERNETES
+            and isinstance(charm.event, charm.StopEvent)
+            # If `tearing_down.exists()`, this unit is being removed for scale down.
+            # Therefore, we should not raise the partition—so that the partition never exceeds
+            # the highest unit number (which would cause `juju refresh` to not trigger any Juju
+            # events).
+            and not tearing_down.exists()
+        ):
+            # This unit could be refreshing or just restarting.
+            # Raise StatefulSet partition to prevent other units from refreshing in case a refresh
+            # is in progress.
+            # If a refresh is not in progress, the leader unit will reset the partition to 0.
+            stateful_set = lightkube.Client().get(
+                lightkube.resources.apps_v1.StatefulSet, charm.app
+            )
+            partition = stateful_set.spec.updateStrategy.rollingUpdate.partition
+            assert partition is not None
+            if partition < charm.unit.number:
+                # Raise partition
+                lightkube.Client().patch(
+                    lightkube.resources.apps_v1.StatefulSet,
+                    charm.app,
+                    {
+                        "spec": {
+                            "updateStrategy": {
+                                "rollingUpdate": {"partition": charm.unit.number}
+                            }
+                        }
+                    },
+                )
+                logger.info(
+                    f"Set StatefulSet partition to {charm.unit.number} during stop event"
+                )
+        dot_juju_charm = pathlib.Path(".juju-charm")
+        self._installed_charm_revision_raw = dot_juju_charm.read_text().strip()
+        """Contents of this unit's .juju-charm file (e.g. "ch:amd64/jammy/postgresql-k8s-381")"""
+
+        if self.charm_specific.cloud is Cloud.MACHINES:
+            # TODO comment
+            self._history = _MachineRefreshHistory.from_file()
+            if (
+                self._history.last_refresh is None
+                or self._history.last_refresh.charm_revision
+                != self._installed_charm_revision_raw
+            ):
+                self._history.last_refresh = _HistoryEntry(
+                    charm_revision=self._installed_charm_revision_raw,
+                    time_of_refresh=dot_juju_charm.stat().st_mtime,
+                )
+            assert self._history.last_refresh is not None
+            if isinstance(charm.event, charm.UpgradeCharmEvent) or isinstance(
+                charm.event, charm.ConfigChangedEvent
+            ):
+                # Charm revision is up-to-date
+                # TODO: add link to juju bug about config change only on up-to-date units
+                # TODO comment: add note that config change will be fired on initial install?
+                if (
+                    self._history.last_refresh_to_up_to_date_charm_revision is None
+                    or self._history.last_refresh_to_up_to_date_charm_revision.charm_revision
+                    != self._history.last_refresh.charm_revision
+                ):
+                    self._history.second_to_last_refresh_to_up_to_date_charm_revision = (
+                        self._history.last_refresh_to_up_to_date_charm_revision
+                    )
+                    self._history.last_refresh_to_up_to_date_charm_revision = (
+                        self._history.last_refresh
+                    )
+            self._history.save_to_file()
+        self._relation = charm.Endpoint("refresh-v-three").relation
+        if not self._relation:
+            raise PeerRelationMissing
+        # TODO comment
+        self._relation.my_unit["pause_after_unit_refresh_config"] = charm.config[
+            "pause_after_unit_refresh"
+        ]
+        with pathlib.Path("refresh_versions.toml").open("rb") as file:
+            self._refresh_versions = tomli.load(file)
+        if self.charm_specific.cloud is Cloud.MACHINES:
+            # TODO comment about purpose is for uncaught exception
+            self.update_snap_revision()
+            if self._history.last_refresh_to_up_to_date_charm_revision:
+                self._relation.my_unit["last_refresh_to_up_to_date_charm_revision"] = (
+                    json.dumps(
+                        dataclasses.asdict(
+                            self._history.last_refresh_to_up_to_date_charm_revision
+                        )
+                    )
+                )
+        self._in_progress = self._is_in_progress()
+        # pre checks
+        # actions?
+        # check in progress again?
+        # set partition? call upgrade?
