@@ -1820,7 +1820,7 @@ class _Kubernetes:
         charm_revision = original_versions.charm_revision.split("-")[
             -1
         ]  # TODO improve docstring/naming on _OriginalVersions
-        rollback_command = f"juju refresh {charm.app} --revision {charm_revision} --resource {self._charm_specific.oci_resource_name}={self._workload_image_name}@{original_versions.workload_container}"
+        rollback_command = f"juju refresh {charm.app} --revision {charm_revision} --resource {self._charm_specific.oci_resource_name}={self._installed_workload_image_name}@{original_versions.workload_container}"
         if force_start and not force_start.check_compatibility:
             force_start.log(
                 f"Skipping check that refresh is to {self._charm_specific.workload_name} container version that has been validated to work with the charm revision"
@@ -2102,7 +2102,14 @@ class _Kubernetes:
             lightkube.resources.core_v1.Pod,
             labels={"app.kubernetes.io/name": charm.app},
         )
-        self._units = sorted((_KubernetesUnit.from_pod(pod) for pod in pods), reverse=True)
+        unsorted_units = []
+        for pod in pods:
+            unit = _KubernetesUnit.from_pod(pod)
+            unsorted_units.append(unit)
+            if unit == charm.unit:
+                this_pod = pod
+        assert this_pod
+        self._units = sorted(unsorted_units, reverse=True)
         """Sorted from highest to lowest unit number (refresh order)"""
         self._unit_controller_revision = next(
             unit for unit in self._units if unit == charm.unit
@@ -2162,7 +2169,6 @@ class _Kubernetes:
             )
         else:
             workload_container = workload_containers[0]
-        this_pod = next(pod for pod in pods if _KubernetesUnit.from_pod(pod) == charm.unit)
         # TODO race condition on startup?
         workload_container_statuses = [
             status
@@ -2178,8 +2184,7 @@ class _Kubernetes:
         # Example: "registry.jujucharms.com/charm/kotcfrohea62xreenq1q75n1lyspke0qkurhk/postgresql-image@sha256:76ef26c7d11a524bcac206d5cb042ebc3c8c8ead73fa0cd69d21921552db03b6"
         image_id = workload_container_statuses[0].imageID
         image_name, image_digest = image_id.split("@")
-        # TODO rename to installed?
-        self._workload_image_name = image_name
+        self._installed_workload_image_name = image_name
         """This unit's workload image name
         
         Includes registry and path
@@ -2230,6 +2235,7 @@ class _Kubernetes:
             self._relation.my_app,
             collections.abc.MutableMapping,
         ):
+            # TODO: add note about doing this before compat check in case force refresh?
             # Save versions in app databag for next refresh
             self._original_versions = _OriginalVersions(
                 workload=self._pinned_workload_version,
@@ -2255,7 +2261,7 @@ class _Kubernetes:
                     charm.event.result = {
                         "result": f"Charm is ready for refresh. For refresh instructions, see {self._charm_specific.refresh_user_docs_url}\n"
                         "After the refresh has started, use this command to rollback (copy this down in case you need it later):\n"
-                        f"`juju refresh {charm.app} --revision {self._original_versions.charm_revision} --resource {self._charm_specific.oci_resource_name}={self._workload_image_name}@{self._original_versions.workload_container}`"
+                        f"`juju refresh {charm.app} --revision {self._original_versions.charm_revision} --resource {self._charm_specific.oci_resource_name}={self._installed_workload_image_name}@{self._original_versions.workload_container}`"
                     }
             else:
                 charm.event.fail(
