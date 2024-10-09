@@ -2214,6 +2214,17 @@ class _Kubernetes:
             for unit in self._units
             if unit.controller_revision == self._app_controller_revision
         )
+        if not up_to_date_units:
+            # No units have refreshed (first unit to refresh should be stopping)
+            # Use units with last controller revision instead
+            # TODO improve comment
+            # TODO maybe remove initial case & improve naming of var
+            # TODO or leave for logging?
+            up_to_date_units = (
+                unit
+                for unit in self._units
+                if unit.controller_revision == self._units[0].controller_revision
+            )
         pause_after_values = (
             # During scale up or initial install, unit or "pause_after_unit_refresh_config" key may
             # be missing from relation
