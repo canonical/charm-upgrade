@@ -1617,7 +1617,7 @@ class _Kubernetes:
             self._relation.my_unit.get(
                 "next_unit_allowed_to_refresh_if_app_controller_revision_hash_equals"
             )
-            == self._app_controller_revision
+            == self._unit_controller_revision
         )
 
     @next_unit_allowed_to_refresh.setter
@@ -1626,7 +1626,7 @@ class _Kubernetes:
             raise ValueError("`next_unit_allowed_to_refresh` can only be set to `True`")
         self._relation.my_unit[
             "next_unit_allowed_to_refresh_if_app_controller_revision_hash_equals"
-        ] = self._app_controller_revision
+        ] = self._unit_controller_revision
         self._set_partition_and_app_status(handle_action=False)
 
     @property
