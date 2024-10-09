@@ -1921,7 +1921,7 @@ class _Kubernetes:
             def __init__(self, event: charm.ActionEvent, /):
                 super().__init__()
                 assert event.action == "resume-refresh"
-                self.check_health_of_refreshed_units: bool = action.parameters[
+                self.check_health_of_refreshed_units: bool = event.parameters[
                     "check-health-of-refreshed-units"
                 ]
 
