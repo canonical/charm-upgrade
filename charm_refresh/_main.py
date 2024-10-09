@@ -1657,12 +1657,6 @@ class _Kubernetes:
         # TODO check if workload is running
         if not self._in_progress:
             return
-        if self._installed_charm_revision_raw.startswith("ch:"):
-            # Charm was deployed from Charmhub; use revision
-            charm_revision = self._installed_charm_revision_raw.split("-")[-1]
-        else:
-            # Charmhub revision is not available; fall back to charm version
-            charm_revision = str(self._installed_charm_version)
         # TODO comment
         workload_container_matches_pin = (
             self._installed_workload_container_version == self._pinned_workload_container_version
@@ -1676,7 +1670,12 @@ class _Kubernetes:
             message = f"{self._charm_specific.workload_name} running"
         if self._unit_controller_revision != self._app_controller_revision:
             message += " (restart pending)"
-        message += f"; Charm revision {charm_revision}"
+        if self._installed_charm_revision_raw.startswith("ch:"):
+            # Charm was deployed from Charmhub; use revision
+            message += f'; Charm revision {self._installed_charm_revision_raw.split("-")[-1]}'
+        else:
+            # Charmhub revision is not available; fall back to charm version
+            message += f"; Charm version {self._installed_charm_version}"
         if not workload_container_matches_pin:
             message += f'; Unexpected container {self._installed_workload_container_version.removeprefix("sha256:")[:6]}'
         return charm.ActiveStatus(message)
