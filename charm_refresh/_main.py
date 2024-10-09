@@ -517,11 +517,7 @@ class _InvalidForceEvent(ValueError):
 
 class _ForceRefreshStartAction(charm.ActionEvent):
     def __init__(
-        self,
-        event: charm.Event,
-        *,
-        first_unit_to_refresh: charm.Unit,
-        in_progress: _InProgress,
+        self, event: charm.Event, *, first_unit_to_refresh: charm.Unit, in_progress: _InProgress
     ):
         if not isinstance(event, charm.ActionEvent):
             raise _InvalidForceEvent
@@ -2099,8 +2095,7 @@ class _Kubernetes:
         """This app's controller revision"""
         assert self._app_controller_revision is not None
         pods = lightkube.Client().list(
-            lightkube.resources.core_v1.Pod,
-            labels={"app.kubernetes.io/name": charm.app},
+            lightkube.resources.core_v1.Pod, labels={"app.kubernetes.io/name": charm.app}
         )
         unsorted_units = []
         for pod in pods:
