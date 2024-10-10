@@ -1816,7 +1816,7 @@ class _Kubernetes:
             -1
         ]  # TODO improve docstring/naming on _OriginalVersions
         rollback_command = f"juju refresh {charm.app} --revision {charm_revision} --resource {self._charm_specific.oci_resource_name}={self._installed_workload_image_name}@{original_versions.workload_container}"
-        if force_start and not force_start.check_compatibility:
+        if force_start and not force_start.check_workload_container:
             force_start.log(
                 f"Skipping check that refresh is to {self._charm_specific.workload_name} container version that has been validated to work with the charm revision"
             )
