@@ -1611,6 +1611,14 @@ class _OriginalVersions:
         databag["original_charm_revision"] = self.charm_revision
 
 
+class KubernetesJujuAppNotTrusted(Exception):
+    """Juju app is not trusted (needed to patch StatefulSet partition)
+
+    User must run `juju trust` with `--scope=cluster`
+    or re-deploy using `juju deploy` with `--trust`
+    """
+
+
 class _Kubernetes:
     @property
     def in_progress(self) -> bool:
@@ -1944,11 +1952,7 @@ class _Kubernetes:
                     f"Must run action on leader unit. (e.g. `juju run {charm.app}/leader resume-refresh`)"
                 )
             return
-        if not self._juju_app_trusted:
-            self._app_status_higher_priority = charm.BlockedStatus(
-                f"Run `juju trust {charm.app} --scope=cluster`. Needed for in-place refreshes"
-            )
-        elif self._pause_after is _PauseAfter.UNKNOWN:
+        if self._pause_after is _PauseAfter.UNKNOWN:
             self._app_status_higher_priority = charm.BlockedStatus(
                 'pause_after_unit_refresh config must be set to "all", "first", or "none"'
             )
@@ -2069,8 +2073,18 @@ class _Kubernetes:
         assert charm_specific.cloud is Cloud.KUBERNETES
         self._charm_specific = charm_specific
 
+        _LOCAL_STATE.mkdir(exist_ok=True)
+        # Save state if unit is tearing down.
+        # Used in future Juju event (stop event) to determine whether to set StatefulSet partition
+        tearing_down = _LOCAL_STATE / "kubernetes_unit_tearing_down"
+        if (
+            isinstance(charm.event, charm.RelationDepartedEvent)
+            and charm.event.departing_unit == charm.unit
+        ):
+            # Unit is tearing down and 1+ other units are not tearing down
+            tearing_down.touch(exist_ok=True)
         # Check if Juju app was deployed with `--trust` (needed to patch StatefulSet partition)
-        self._juju_app_trusted = (
+        if not (
             lightkube.Client()
             .create(
                 lightkube.resources.authorization_v1.SelfSubjectAccessReview(
@@ -2085,22 +2099,15 @@ class _Kubernetes:
                 )
             )
             .status.allowed
-        )
-        if not self._juju_app_trusted:
+        ):
             logger.warning(
                 f"Run `juju trust {charm.app} --scope=cluster`. Needed for in-place refreshes"
             )
-
-        _LOCAL_STATE.mkdir(exist_ok=True)
-        # Save state if unit is tearing down.
-        # Used in future Juju event (stop event) to determine whether to set StatefulSet partition
-        tearing_down = _LOCAL_STATE / "kubernetes_unit_tearing_down"
-        if (
-            isinstance(charm.event, charm.RelationDepartedEvent)
-            and charm.event.departing_unit == charm.unit
-        ):
-            # Unit is tearing down and 1+ other units are not tearing down
-            tearing_down.touch(exist_ok=True)
+            if charm.is_leader:
+                charm.app_status = charm.BlockedStatus(
+                    f"Run `juju trust {charm.app} --scope=cluster`. Needed for in-place refreshes"
+                )
+            raise KubernetesJujuAppNotTrusted
         if (
             isinstance(charm.event, charm.StopEvent)
             # If `tearing_down.exists()`, this unit is being removed for scale down.
