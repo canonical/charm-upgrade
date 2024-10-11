@@ -10,6 +10,7 @@ import platform
 import typing
 
 import charm
+import charm_json
 import httpx
 import lightkube
 import lightkube.resources.apps_v1
@@ -1587,7 +1588,7 @@ class _OriginalVersions:
     charm_revision: str
 
     @classmethod
-    def from_app_databag(cls, databag: typing.Mapping[str, str], /):
+    def from_app_databag(cls, databag: collections.abc.Mapping, /):
         try:
             return cls(
                 workload=databag["original_workload_version"],
@@ -1596,10 +1597,12 @@ class _OriginalVersions:
                 charm_revision=databag["original_charm_revision"],
             )
         except (KeyError, ValueError):
-            # TODO improve message (e.g. if someone accidentally refreshed from v1)
-            raise ValueError("Original versions in app databag are missing or invalid")
+            # This should only happen if user refreshes from a charm without refresh v3
+            raise ValueError(
+                "Refresh failed. Automatic recovery not possible. Original versions in app databag are missing or invalid"
+            )
 
-    def write_to_app_databag(self, databag: typing.MutableMapping[str, str], /):
+    def write_to_app_databag(self, databag: collections.abc.MutableMapping, /):
         databag["original_workload_version"] = self.workload
         databag["original_workload_container_version"] = self.workload_container
         databag["original_charm_version"] = str(self.charm)
@@ -1633,13 +1636,20 @@ class _Kubernetes:
     def workload_allowed_to_start(self) -> bool:
         if not self._in_progress:
             return True
+        original_versions = _OriginalVersions.from_app_databag(self._relation.my_app)
+        if (
+            original_versions.charm == self._installed_charm_version
+            and original_versions.workload_container == self._installed_workload_container_version
+        ):
+            # Unit has not refreshed or unit is rolling back
+            return True
         for unit in self._units:
             if (
                 # During scale up, unit may be missing from relation
-                self._relation.get(unit, {}).get(
-                    "refresh_started_if_app_controller_revision_hash_equals"
+                self._unit_controller_revision
+                in self._relation.get(unit, {}).get(
+                    "refresh_started_if_app_controller_revision_hash_in", tuple()
                 )
-                == self._unit_controller_revision
             ):
                 return True
         return False
@@ -1780,10 +1790,10 @@ class _Kubernetes:
             return
         self._refresh_started = any(
             # During scale up, unit may be missing from relation
-            self._relation.get(unit, {}).get(
-                "refresh_started_if_app_controller_revision_hash_equals"
+            self._app_controller_revision
+            in self._relation.get(unit, {}).get(
+                "refresh_started_if_app_controller_revision_hash_in", tuple()
             )
-            == self._app_controller_revision
             for unit in self._units
         )
         """TODO"""  # TODO
@@ -1803,10 +1813,6 @@ class _Kubernetes:
         ):
             # Rollback to original charm code & workload container version; skip checks
             self._refresh_started = True
-            self._relation.my_unit["refresh_started_if_app_controller_revision_hash_equals"] = (
-                self._unit_controller_revision
-            )
-            self._refresh_started_local_state.touch()
             if force_start:
                 force_start.fail("refresh already started")  # TODO UX
             return
@@ -1895,9 +1901,11 @@ class _Kubernetes:
                 force_start.log("Pre-refresh checks successful")
         # All checks that ran succeeded
         self._refresh_started = True
-        self._relation.my_unit["refresh_started_if_app_controller_revision_hash_equals"] = (
-            self._unit_controller_revision
+        hashes: typing.MutableSequence[str] = self._relation.my_unit.setdefault(
+            "refresh_started_if_app_controller_revision_hash_in", tuple()
         )
+        if self._unit_controller_revision not in hashes:
+            hashes.append(self._unit_controller_revision)
         self._refresh_started_local_state.touch()
         if force_start:
             force_start.result = {
@@ -2076,7 +2084,7 @@ class _Kubernetes:
                 self._set_partition(charm.unit.number)
                 logger.info(f"Set StatefulSet partition to {charm.unit.number} during stop event")
 
-        self._relation = charm.Endpoint("refresh-v-three").relation
+        self._relation = charm_json.PeerRelation.from_endpoint("refresh-v-three")
         if not self._relation:
             raise PeerRelationMissing
 
@@ -2194,9 +2202,11 @@ class _Kubernetes:
         self._refresh_started_local_state = _LOCAL_STATE / "kubernetes_refresh_started"
         # TODO comment
         if self._refresh_started_local_state.exists():
-            self._relation.my_unit["refresh_started_if_app_controller_revision_hash_equals"] = (
-                self._unit_controller_revision
+            hashes: typing.MutableSequence[str] = self._relation.my_unit.setdefault(
+                "refresh_started_if_app_controller_revision_hash_in", tuple()
             )
+            if self._unit_controller_revision not in hashes:
+                hashes.append(self._unit_controller_revision)
 
         # Determine `self._in_progress`
         for unit in self._units:
@@ -2227,6 +2237,9 @@ class _Kubernetes:
         pause_after_values = (value for value in pause_after_values if value is not None)
         self._pause_after = max(_PauseAfter(value) for value in pause_after_values)
 
+        if not self._in_progress:
+            # Clean up state that is no longer in use
+            self._relation.my_unit.pop("refresh_started_if_app_controller_revision_hash_in", None)
         if not self._in_progress and isinstance(
             # Whether this unit is leader
             self._relation.my_app,
