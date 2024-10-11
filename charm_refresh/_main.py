@@ -1942,11 +1942,18 @@ class _Kubernetes:
                     f"Must run action on leader unit. (e.g. `juju run {charm.app}/leader resume-refresh`)"
                 )
             return
+        # TODO k8s trust
+        if self._pause_after is _PauseAfter.UNKNOWN:
+            self._app_status_higher_priority = charm.BlockedStatus(
+                'pause_after_unit_refresh config must be set to "all", "first", or "none"'
+            )
         if not self._in_progress:
             self._set_partition(0)
             if handle_action and action:
                 action.fail("No refresh in progress")
             # TODO log
+            if self._app_status_higher_priority:
+                charm.app_status = self._app_status_higher_priority
             return
         if (
             handle_action
