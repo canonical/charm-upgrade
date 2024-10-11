@@ -13,7 +13,9 @@ import charm
 import charm_json
 import httpx
 import lightkube
+import lightkube.models.authorization_v1
 import lightkube.resources.apps_v1
+import lightkube.resources.authorization_v1
 import lightkube.resources.core_v1
 import ops
 import packaging.version
@@ -1942,8 +1944,11 @@ class _Kubernetes:
                     f"Must run action on leader unit. (e.g. `juju run {charm.app}/leader resume-refresh`)"
                 )
             return
-        # TODO k8s trust
-        if self._pause_after is _PauseAfter.UNKNOWN:
+        if not self._juju_app_trusted:
+            self._app_status_higher_priority = charm.BlockedStatus(
+                f"Run `juju trust {charm.app} --scope=cluster`. Needed for in-place refreshes"
+            )
+        elif self._pause_after is _PauseAfter.UNKNOWN:
             self._app_status_higher_priority = charm.BlockedStatus(
                 'pause_after_unit_refresh config must be set to "all", "first", or "none"'
             )
@@ -2063,6 +2068,28 @@ class _Kubernetes:
     def __init__(self, charm_specific: CharmSpecific, /):
         assert charm_specific.cloud is Cloud.KUBERNETES
         self._charm_specific = charm_specific
+
+        # Check if Juju app was deployed with `--trust` (needed to patch StatefulSet partition)
+        self._juju_app_trusted = (
+            lightkube.Client()
+            .create(
+                lightkube.resources.authorization_v1.SelfSubjectAccessReview(
+                    spec=lightkube.models.authorization_v1.SelfSubjectAccessReviewSpec(
+                        resourceAttributes=lightkube.models.authorization_v1.ResourceAttributes(
+                            name=charm.app,
+                            namespace=charm.model,
+                            resource="statefulset",
+                            verb="patch",
+                        )
+                    )
+                )
+            )
+            .status.allowed
+        )
+        if not self._juju_app_trusted:
+            logger.warning(
+                f"Run `juju trust {charm.app} --scope=cluster`. Needed for in-place refreshes"
+            )
 
         _LOCAL_STATE.mkdir(exist_ok=True)
         # Save state if unit is tearing down.
