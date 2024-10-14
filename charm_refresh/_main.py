@@ -1647,13 +1647,6 @@ class _Kubernetes:
     def workload_allowed_to_start(self) -> bool:
         if not self._in_progress:
             return True
-        original_versions = _OriginalVersions.from_app_databag(self._relation.my_app)
-        if (
-            original_versions.charm == self._installed_charm_version
-            and original_versions.workload_container == self._installed_workload_container_version
-        ):
-            # Unit has not refreshed or unit is rolling back
-            return True
         for unit in self._units:
             if (
                 # During scale up, unit may be missing from relation
@@ -1663,6 +1656,14 @@ class _Kubernetes:
                 )
             ):
                 return True
+        original_versions = _OriginalVersions.from_app_databag(self._relation.my_app)
+        if (
+            original_versions.charm == self._installed_charm_version
+            and original_versions.workload_container == self._installed_workload_container_version
+        ):
+            # This unit has not refreshed
+            # (If this unit is rolling back, `True` should have been returned earlier)
+            return True
         return False
 
     @property
@@ -1811,19 +1812,23 @@ class _Kubernetes:
 
         if not charm.unit == self._units[0]:
             return
+        if not self._refresh_started:
+            # Check if this unit is rolling back
+            original_versions = _OriginalVersions.from_app_databag(self._relation.my_app)
+            if (
+                original_versions.charm == self._installed_charm_version
+                and original_versions.workload_container
+                == self._installed_workload_container_version
+            ):
+                # Rollback to original charm code & workload container version; skip checks
+                self._refresh_started = True
+                hashes: typing.MutableSequence[str] = self._relation.my_unit.setdefault(
+                    "refresh_started_if_app_controller_revision_hash_in", tuple()
+                )
+                if self._unit_controller_revision not in hashes:
+                    hashes.append(self._unit_controller_revision)
+                self._refresh_started_local_state.touch()
         if self._refresh_started:
-            if force_start:
-                force_start.fail("refresh already started")  # TODO UX
-            return
-
-        # Check if this unit is rolling back
-        original_versions = _OriginalVersions.from_app_databag(self._relation.my_app)
-        if (
-            original_versions.charm == self._installed_charm_version
-            and original_versions.workload_container == self._installed_workload_container_version
-        ):
-            # Rollback to original charm code & workload container version; skip checks
-            self._refresh_started = True
             if force_start:
                 force_start.fail("refresh already started")  # TODO UX
             return
