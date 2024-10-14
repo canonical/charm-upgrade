@@ -426,6 +426,7 @@ class CharmSpecific(abc.ABC):
         """
         if not cls._is_charm_version_compatible(old=old_charm_version, new=new_charm_version):
             return False
+        return True
 
 
 class PeerRelationMissing(Exception):
